@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server';
 import { z } from 'zod';
 import { Prisma } from '@/app/generated/prisma/client';
 import { MetaApiError } from '@/lib/meta/client';
+import { getBaseUrl } from '@/lib/env';
 import { canManageWorkspace, getCurrentWorkspaceContext, type WorkspaceContext } from '@/lib/workspace-access';
 
 export class ConnectionError extends Error {
@@ -16,7 +17,12 @@ export function withZernioManagement(handler: (context: WorkspaceContext, reques
       if (!canManageWorkspace(context.role)) throw new ConnectionError('Only workspace owners and admins can manage the Zernio connection.', 403);
       if (request.method !== 'GET') {
         const origin = request.headers.get('origin');
-        if (origin && origin !== new URL(request.url).origin) throw new ConnectionError('Invalid request origin.', 403);
+        // Compare against NEXTAUTH_URL, not request.url: behind a reverse
+        // proxy (Traefik terminates TLS, forwards over plain HTTP) Next sees
+        // the internal http:// connection, so request.url's origin never
+        // matches the browser's https:// Origin header even on a same-site
+        // request. NEXTAUTH_URL is already the trusted public origin.
+        if (origin && origin !== new URL(getBaseUrl()).origin) throw new ConnectionError('Invalid request origin.', 403);
       }
       return await handler(context, request);
     } catch (error) {
