@@ -1,0 +1,143 @@
+# docker-compose.prod.yml — Production stack for OpenReply.
+# Deploys to the shared VPS that already runs Beam ISP Billing (and other
+# apps) behind Traefik v3.
+#
+# Prerequisites on the server:
+#   1. The shared `web` Docker network exists (created by the Traefik compose project)
+#   2. DNS A record points openreply.beam.ke at this VPS
+#   3. .env populated (see .env.example) — NOT committed
+#
+# Deploy:
+#   docker compose -f docker-compose.prod.yml build web
+#   docker compose -f docker-compose.prod.yml up -d
+#
+# Only `web` builds/tags the image (openreply-app:latest); worker and cron
+# reuse that tag with no build key of their own, so a rebuild only ever
+# happens once per deploy — always `build web` before `up -d`, or worker/cron
+# silently keep running the previous image.
+#
+# Router name used (must be unique across all projects on this VPS): openreply
+
+x-app-env: &app-env
+  NEXTAUTH_URL: ${NEXTAUTH_URL}
+  NEXTAUTH_SECRET: ${NEXTAUTH_SECRET}
+  CRON_SECRET: ${CRON_SECRET}
+  ENCRYPTION_KEY: ${ENCRYPTION_KEY}
+  DATABASE_URL: ${DATABASE_URL}
+  REDIS_URL: ${REDIS_URL}
+  RESEND_API_KEY: ${RESEND_API_KEY:-}
+  EMAIL_FROM: ${EMAIL_FROM:-}
+  EMAIL_SERVER: ${EMAIL_SERVER:-}
+  ALLOWED_EMAILS: ${ALLOWED_EMAILS:-}
+  META_GRAPH_API_VERSION: ${META_GRAPH_API_VERSION:-v25.0}
+  INSTAGRAM_APP_ID: ${INSTAGRAM_APP_ID:-}
+  INSTAGRAM_APP_SECRET: ${INSTAGRAM_APP_SECRET:-}
+  FACEBOOK_APP_SECRET: ${FACEBOOK_APP_SECRET:-}
+  WEBHOOK_VERIFY_TOKEN: ${WEBHOOK_VERIFY_TOKEN:-}
+
+services:
+  # ── PostgreSQL ──────────────────────────────────────────────────────────
+  # Internal only — no ports published to the host, not joined to the web network.
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - default
+
+  # ── Redis (BullMQ broker + rate limiter) ───────────────────────────────
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - default
+
+  # ── Web app + API ───────────────────────────────────────────────────────
+  # Served at https://openreply.beam.ke via Traefik. Runs pending migrations
+  # before `next start` — the image is built with no DB access (see
+  # Dockerfile), so `prisma migrate deploy` cannot happen at build time.
+  web:
+    build:
+      context: .
+    image: openreply-app:latest
+    restart: unless-stopped
+    command: sh -c "npx prisma migrate deploy && npm run start"
+    environment: *app-env
+    expose:
+      - "3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "-T", "5", "http://localhost:3000/"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 40s
+    networks:
+      - default
+      - web
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=web
+      - traefik.http.routers.openreply.rule=Host(`openreply.beam.ke`)
+      - traefik.http.routers.openreply.entrypoints=websecure
+      - traefik.http.routers.openreply.tls.certresolver=letsencrypt
+      - traefik.http.services.openreply.loadbalancer.server.port=3000
+
+  # ── Worker ──────────────────────────────────────────────────────────────
+  # Long-running queue consumer — sends the DMs, runs the polling
+  # reconciler. Must stay always-on; waits on web's healthcheck so
+  # migrations are guaranteed applied before it touches the schema.
+  worker:
+    image: openreply-app:latest
+    restart: unless-stopped
+    command: npm run worker
+    environment: *app-env
+    depends_on:
+      web:
+        condition: service_healthy
+    networks:
+      - default
+
+  # ── Cron ────────────────────────────────────────────────────────────────
+  # Nothing runs vercel.json's `crons` block off Vercel — this replaces it.
+  # refresh-tokens/attach-next-reel/snapshot-followers all silently no-op
+  # forever without this service. See docs/deploy-dokploy.md Gotcha #4.
+  cron:
+    image: openreply-app:latest
+    restart: unless-stopped
+    command: sh scripts/cron.sh
+    environment:
+      <<: *app-env
+      CRON_BASE_URL: http://web:3000
+    depends_on:
+      web:
+        condition: service_healthy
+    networks:
+      - default
+
+volumes:
+  postgres_data:
+
+networks:
+  default:
+  web:
+    external: true # shared Traefik network — created by the Traefik compose project
